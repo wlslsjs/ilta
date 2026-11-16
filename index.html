@@ -341,7 +341,7 @@ tbody tr:hover { background: #22252a; }
       <button class="active" data-page="dashboard">▦ 대시보드</button>
       <button data-page="records">▤ 전체 정산내역</button>
       <button data-page="employees">♙ 직원별 정산</button>
-      <button data-page="meal">🍽️ 식대 지출 관리</button>
+      <button data-page="meal" class="admin-only">🍽️ 식대 지출 관리</button>
       <button data-page="expense" class="admin-only">📢 광고비·경비 관리</button>
       <button data-page="entry">＋ 정산 등록</button>
       <button data-page="settings">⚙ 설정</button>
@@ -800,7 +800,7 @@ tbody tr:hover { background: #22252a; }
           <button onclick="changeEmployeeCredentials()">직원 로그인 정보 저장</button>
         </div>
       </div>
-      <div class="panel">
+      <div class="panel admin-only">
         <div class="panelhead">
           <h2>데이터 백업 / 복원</h2>
         </div>
@@ -833,17 +833,58 @@ tbody tr:hover { background: #22252a; }
       <b style="color:var(--gold2)">직원 공통 로그인</b>
       <input id="employeeUsernameInput" autocomplete="username" placeholder="직원 공통 아이디" onkeydown="if(event.key==='Enter')enterEmployee()">
       <input type="password" id="employeePasswordInput" autocomplete="current-password" placeholder="직원 공통 비밀번호" onkeydown="if(event.key==='Enter')enterEmployee()">
+      <select id="employeeNameInput" style="width:100%;padding:12px;background:#111317;color:white;border:1px solid #444;border-radius:8px;margin:8px 0 12px">
+        <option value="">본인 이름 선택</option>
+      </select>
       <button class="secondary" style="width:100%" onclick="enterEmployee()">직원 로그인</button>
     </div>
-    <p class="hint">초기 직원 로그인: ilta / 1111<br>대표 로그인 정보는 보안을 위해 안내되지 않습니다.<br>로그인 후 설정에서 변경할 수 있습니다.</p>
+    <p class="hint">인터넷 서버에 저장되어 모든 PC에서 자료가 공유됩니다.<br>직원 로그인 정보는 대표가 설정에서 변경할 수 있습니다.</p>
   </div>
 </div>
 
 <div class="toast" id="toast"></div>
 
 <script>
+// Supabase cloud sync: the publishable key is intended for browser use.
+const ILTA_API_URL = 'https://gjgctwqktahojdhaavbe.supabase.co/functions/v1/ilta-sync';
+const ILTA_PUBLISHABLE_KEY = 'sb_publishable_oaCNVAZckDmtzI5ro-5dNw_w3z8zbGW';
+let cloudUsername = '', cloudPassword = '', cloudReady = false, saveQueue = Promise.resolve();
+async function cloudRequest(payload) {
+  const response = await fetch(ILTA_API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'apikey': ILTA_PUBLISHABLE_KEY, 'Authorization': 'Bearer ' + ILTA_PUBLISHABLE_KEY },
+    body: JSON.stringify(payload)
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || '서버 연결에 실패했습니다.');
+  return result;
+}
+function applyCloudData(data) {
+  if (!data) return;
+  staffList = Array.isArray(data.staffList) ? data.staffList : DEFAULT_STAFF;
+  records = Array.isArray(data.records) ? data.records : [];
+  mealRecords = Array.isArray(data.mealRecords) ? data.mealRecords : [];
+  expenseRecords = Array.isArray(data.expenseRecords) ? data.expenseRecords : [];
+  staffRatios = data.staffRatios || {};
+  staffList.forEach(n => { if (staffRatios[n] === undefined) staffRatios[n] = 100; });
+}
+async function refreshCloudData() {
+  if (!cloudReady || !cloudUsername || !cloudPassword) return;
+  // 입력 중인 계약 양식은 덮어쓰지 않습니다.
+  if ($('entry')?.classList.contains('show')) return;
+  try {
+    const result = await cloudRequest({ action: 'refresh', role: currentRole, username: cloudUsername, password: cloudPassword, employeeName: currentEmployeeName });
+    applyCloudData(result.data);
+    renderAll();
+  } catch (err) {
+    console.warn('자동 새로고침:', err.message);
+    if (String(err.message).includes('로그인이 만료')) { alert('로그인 정보가 변경되어 다시 로그인해야 합니다.'); logout(); }
+  }
+}
+setInterval(refreshCloudData, 8000);
 const DEFAULT_STAFF = ['신주섭', '임인', '황인국'];
 let currentRole = 'employee';
+let currentEmployeeName = '';
 let staffList = JSON.parse(localStorage.getItem('ilta_staff') || 'null') || DEFAULT_STAFF;
 let records = JSON.parse(localStorage.getItem('ilta_records') || '[]');
 let mealRecords = JSON.parse(localStorage.getItem('ilta_meal_records') || '[]');
@@ -894,72 +935,95 @@ function renderRatioInputs() {
   if ($('adminRatioInputsContainer2')) $('adminRatioInputsContainer2').innerHTML = html;
 }
 
+async function cloudDeleteItem(itemType, id) {
+  if (!cloudReady) return;
+  await cloudRequest({ action: 'deleteItem', role: currentRole, username: cloudUsername, password: cloudPassword, employeeName: currentEmployeeName, itemType, id });
+}
 const save = () => {
+  // Keep a local recovery copy while synchronizing the shared cloud data.
   localStorage.setItem('ilta_staff', JSON.stringify(staffList));
   localStorage.setItem('ilta_records', JSON.stringify(records));
   localStorage.setItem('ilta_meal_records', JSON.stringify(mealRecords));
   localStorage.setItem('ilta_expense_records', JSON.stringify(expenseRecords));
   localStorage.setItem('ilta_staff_ratios', JSON.stringify(staffRatios));
+  if (!cloudReady || !cloudUsername || !cloudPassword) return;
+  const payload = { staffList, records, mealRecords, expenseRecords, staffRatios };
+  saveQueue = saveQueue.then(() => cloudRequest({ action: 'save', role: currentRole, username: cloudUsername, password: cloudPassword, employeeName: currentEmployeeName, data: payload }))
+    .catch(err => { console.error(err); toast('서버 저장 실패: ' + err.message); });
 };
 
-function enterEmployee() {
-  let u = localStorage.getItem('ilta_employee_username') || 'ilta',
-      p = localStorage.getItem('ilta_employee_password') || '1111';
-  if ($('employeeUsernameInput').value !== u || $('employeePasswordInput').value !== p) {
-    alert('직원 아이디 또는 비밀번호가 올바르지 않습니다.');
-    return;
-  }
-  currentRole = 'employee';
-  document.body.classList.add('employee-view');
-  $('loginVeil').classList.add('hidden');
-  $('roleLabel').textContent = '직원 화면';
-  renderAll();
+async function enterEmployee() {
+  const username = $('employeeUsernameInput').value.trim();
+  const password = $('employeePasswordInput').value;
+  const selectedName = $('employeeNameInput').value;
+  if (!username || !password || !selectedName) return alert('직원 아이디, 비밀번호와 본인 이름을 입력해 주세요.');
+  try {
+    const result = await cloudRequest({ action: 'login', role: 'employee', username, password, employeeName: selectedName });
+    if (result.empty) return alert('대표가 먼저 로그인해 자료를 초기화해야 합니다.');
+    applyCloudData(result.data);
+    cloudUsername = username; cloudPassword = password; cloudReady = true;
+    currentRole = 'employee'; currentEmployeeName = selectedName;
+    applyEmployeeView(); $('loginVeil').classList.add('hidden');
+    $('roleLabel').textContent = selectedName + ' 직원 화면'; renderAll();
+  } catch (err) { alert(err.message || '직원 로그인을 확인해 주세요.'); }
 }
 
-function enterAdmin() {
-  let u = localStorage.getItem('ilta_admin_username') || 'shin',
-      p = localStorage.getItem('ilta_admin_password') || 'wntjqdbfl2@';
-  if ($('adminUsernameInput').value !== u || $('adminPasswordInput').value !== p) {
-    alert('대표 아이디 또는 비밀번호가 올바르지 않습니다.');
-    return;
-  }
-  currentRole = 'admin';
-  document.body.classList.remove('employee-view');
-  $('loginVeil').classList.add('hidden');
-  $('roleLabel').textContent = '대표 화면';
-  renderRatioInputs();
-  renderAll();
+async function enterAdmin() {
+  const username = $('adminUsernameInput').value.trim();
+  const password = $('adminPasswordInput').value;
+  if (!username || !password) return alert('대표 아이디와 비밀번호를 입력해 주세요.');
+  try {
+    const result = await cloudRequest({ action: 'login', role: 'admin', username, password });
+    if (result.empty) {
+      // 최초 1회: 이 컴퓨터에 남아 있는 기존 자료를 클라우드로 옮깁니다.
+      const localData = {
+        staffList: JSON.parse(localStorage.getItem('ilta_staff') || 'null') || DEFAULT_STAFF,
+        records: JSON.parse(localStorage.getItem('ilta_records') || '[]'),
+        mealRecords: JSON.parse(localStorage.getItem('ilta_meal_records') || '[]'),
+        expenseRecords: JSON.parse(localStorage.getItem('ilta_expense_records') || '[]'),
+        staffRatios: JSON.parse(localStorage.getItem('ilta_staff_ratios') || '{}')
+      };
+      await cloudRequest({ action: 'initialize', role: 'admin', username, password, data: localData });
+      applyCloudData(localData);
+    } else applyCloudData(result.data);
+    cloudUsername = username; cloudPassword = password; cloudReady = true;
+    currentRole = 'admin'; currentEmployeeName = '';
+    document.body.classList.remove('employee-view'); $('loginVeil').classList.add('hidden');
+    $('roleLabel').textContent = '대표 화면'; renderRatioInputs(); renderAll();
+  } catch (err) { alert(err.message || '대표 로그인을 확인해 주세요.'); }
 }
-
 function logout() {
   ['adminUsernameInput', 'adminPasswordInput', 'employeeUsernameInput', 'employeePasswordInput'].forEach(id => $(id).value = '');
+  $('employeeNameInput').value = '';
+  currentEmployeeName = '';
+  currentRole = 'employee';
+  cloudUsername = ''; cloudPassword = ''; cloudReady = false;
+  document.body.classList.add('employee-view');
   $('loginVeil').classList.remove('hidden');
 }
 
-function changeAdminCredentials() {
+async function changeAdminCredentials() {
   if (currentRole !== 'admin') return;
-  let u = $('newAdminUsername').value.trim(),
-      p = $('newAdminPassword').value;
+  let u = $('newAdminUsername').value.trim(), p = $('newAdminPassword').value;
   if (!u || p.length < 4) return alert('대표 아이디를 입력하고 비밀번호는 4자리 이상 설정하세요.');
-  localStorage.setItem('ilta_admin_username', u);
-  localStorage.setItem('ilta_admin_password', p);
-  $('newAdminUsername').value = '';
-  $('newAdminPassword').value = '';
-  toast('대표 로그인 정보가 변경되었습니다.');
+  try {
+    await cloudRequest({ action: 'changeCredentials', role: 'admin', username: cloudUsername, password: cloudPassword, target: 'admin', newUsername: u, newPassword: p });
+    cloudUsername = u; cloudPassword = p;
+    $('newAdminUsername').value = ''; $('newAdminPassword').value = '';
+    toast('대표 로그인 정보가 서버에 변경되었습니다.');
+  } catch (err) { alert(err.message); }
 }
 
-function changeEmployeeCredentials() {
+async function changeEmployeeCredentials() {
   if (currentRole !== 'admin') return;
-  let u = $('newEmployeeUsername').value.trim(),
-      p = $('newEmployeePassword').value;
+  let u = $('newEmployeeUsername').value.trim(), p = $('newEmployeePassword').value;
   if (!u || p.length < 4) return alert('직원 공통 아이디를 입력하고 비밀번호는 4자리 이상 설정하세요.');
-  localStorage.setItem('ilta_employee_username', u);
-  localStorage.setItem('ilta_employee_password', p);
-  $('newEmployeeUsername').value = '';
-  $('newEmployeePassword').value = '';
-  toast('직원 공통 로그인 정보가 변경되었습니다.');
+  try {
+    await cloudRequest({ action: 'changeCredentials', role: 'admin', username: cloudUsername, password: cloudPassword, target: 'employee', newUsername: u, newPassword: p });
+    $('newEmployeeUsername').value = ''; $('newEmployeePassword').value = '';
+    toast('직원 공통 로그인 정보가 서버에 변경되었습니다.');
+  } catch (err) { alert(err.message); }
 }
-
 function toast(msg) {
   let t = $('toast');
   t.textContent = msg;
@@ -968,6 +1032,10 @@ function toast(msg) {
 }
 
 function showPage(p) {
+  if (currentRole === 'employee' && ['expense', 'settings', 'meal'].includes(p)) {
+    toast('대표 계정에서만 이용할 수 있습니다.');
+    return;
+  }
   document.querySelectorAll('.section').forEach(x => x.classList.remove('show'));
   $(p).classList.add('show');
   document.querySelectorAll('.nav button').forEach(b => b.classList.toggle('active', b.dataset.page === p));
@@ -993,9 +1061,26 @@ function total(r) { return (Number(r.tenantFee) || 0) + (Number(r.landlordFee) |
 function getRoleFilteredRecords() {
   if (currentRole === 'employee') {
     const curMonth = getCurrentMonthStr();
-    return records.filter(r => (r.contractDate || '').startsWith(curMonth));
+    return records.filter(r => r.staff === currentEmployeeName && (r.contractDate || '').startsWith(curMonth));
   }
   return records;
+}
+
+function getVisibleRecords() {
+  return currentRole === 'admin' ? records : records.filter(r => r.staff === currentEmployeeName);
+}
+
+function applyEmployeeView() {
+  const isEmployee = currentRole === 'employee';
+  document.body.classList.toggle('employee-view', isEmployee);
+  const preview = $('feePreview')?.parentElement;
+  if (preview) preview.classList.toggle('hidden', isEmployee);
+  // Employee login is restricted to their selected name in the interface.
+  const staffField = $('staff');
+  if (staffField) {
+    staffField.disabled = isEmployee;
+    staffField.value = isEmployee ? currentEmployeeName : staffField.value;
+  }
 }
 
 function byStaff(name, recordSet = records) { 
@@ -1005,6 +1090,7 @@ function byStaff(name, recordSet = records) {
 function renderAll() {
   const currentMonth = getCurrentMonthStr();
   const targetRecords = getRoleFilteredRecords();
+  const countRecords = records; // 계약 건수는 직원 로그인에서도 전체 공개
 
   if (currentRole === 'employee') {
     $('cardTotalCountLabel').textContent = '당월 계약 건수';
@@ -1019,27 +1105,47 @@ function renderAll() {
     renderRatioInputs();
   }
 
-  $('totalCount').textContent = targetRecords.length + '건';
+  $('totalCount').textContent = countRecords.length + '건';
 
-  $('dashEmployees').innerHTML = staffList.map(n => {
-    let a = byStaff(n, targetRecords);
+  const dashboardStaff = staffList;
+  $('dashEmployees').innerHTML = dashboardStaff.map(n => {
+    let a = byStaff(n, countRecords);
     let sumFee = a.reduce((s, r) => s + total(r), 0);
     let ratio = staffRatios[n] !== undefined ? staffRatios[n] : 100;
     let ratioFee = sumFee * (ratio / 100);
     
     let adminRatioRow = currentRole === 'admin' ? `<small style="color:var(--gold2);font-weight:bold">대표 정산(${ratio}%): ${formatFee(ratioFee)}</small>` : '';
 
-    return `<div class="emp"><h3>${esc(n)}</h3><strong>${a.length}건</strong><small>수수료 합계 ${formatFee(sumFee)}</small>${adminRatioRow}</div>`;
+    return currentRole === 'admin'
+      ? `<div class="emp"><h3>${esc(n)}</h3><strong>${a.length}건</strong><small>수수료 합계 ${formatFee(sumFee)}</small>${adminRatioRow}</div>`
+      : `<div class="emp"><h3>${esc(n)}</h3><strong>${a.length}건</strong><small>당월 계약 건수</small></div>`;
   }).join('');
 
-  let recent = [...records].sort((a, b) => (b.contractDate || '').localeCompare(a.contractDate || '')).slice(0, 5);
-  $('recentRows').innerHTML = recent.length ? recent.map(r => `<tr><td>${esc(r.staff)}</td><td>${esc(r.contractDate)}</td><td>${esc(r.address)}</td><td class="amount">${formatFee(r.tenantFee)}</td><td class="amount">${formatFee(r.landlordFee)}</td><td class="amount">${formatFee(total(r))}</td></tr>`).join('') : '<tr><td colspan="6" class="empty">등록된 정산 내역이 없습니다.</td></tr>';
+  const recentSource = currentRole === 'admin' ? records : records.filter(r => r.staff === currentEmployeeName);
+  let recent = [...recentSource].sort((a, b) => (b.contractDate || '').localeCompare(a.contractDate || '')).slice(0, 5);
+  if (currentRole === 'admin') {
+    $('recentRows').innerHTML = recent.length ? recent.map(r => `<tr><td>${esc(r.staff)}</td><td>${esc(r.contractDate)}</td><td>${esc(r.address)}</td><td class="amount">${formatFee(r.tenantFee)}</td><td class="amount">${formatFee(r.landlordFee)}</td><td class="amount">${formatFee(total(r))}</td></tr>`).join('') : '<tr><td colspan="6" class="empty">등록된 정산 내역이 없습니다.</td></tr>';
+  } else {
+    $('recentRows').innerHTML = recent.length ? recent.map(r => `<tr><td>${esc(r.staff)}</td><td>${esc(r.contractDate)}</td><td>${esc(r.address)} ${esc(r.unit || '')}</td></tr>`).join('') : '<tr><td colspan="3" class="empty">등록된 계약 내역이 없습니다.</td></tr>';
+  }
 
   let opts = staffList.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
   $('staff').innerHTML = opts;
+  if (currentRole === 'employee' && currentEmployeeName) {
+    $('staff').value = currentEmployeeName;
+    $('staff').disabled = true;
+  } else {
+    $('staff').disabled = false;
+  }
   $('staffFilter').innerHTML = '<option value="">전체 직원</option>' + opts;
   $('employeeSelect').innerHTML = opts;
   $('mealStaff').innerHTML = opts;
+  const employeeNameInput = $('employeeNameInput');
+  if (employeeNameInput) {
+    const selectedEmployee = employeeNameInput.value;
+    employeeNameInput.innerHTML = '<option value="">본인 이름 선택</option>' + opts;
+    if (staffList.includes(selectedEmployee)) employeeNameInput.value = selectedEmployee;
+  }
   
   if ($('employeeDetailMonth') && !$('employeeDetailMonth').value) {
     $('employeeDetailMonth').value = currentMonth;
@@ -1051,6 +1157,34 @@ function renderAll() {
     $('expenseDate').value = new Date().toISOString().slice(0, 10);
   }
 
+  if (currentRole === 'employee') {
+    document.querySelector('#recentRows')?.closest('table')?.querySelector('thead')?.replaceChildren(
+      Object.assign(document.createElement('tr'), { innerHTML: '<th>직원</th><th>계약일</th><th>주소 / 호실</th>' })
+    );
+    document.querySelector('#recordRows')?.closest('table')?.querySelector('thead')?.replaceChildren(
+      Object.assign(document.createElement('tr'), { innerHTML: '<th>계약일</th><th>주소</th><th>건물</th><th>호실</th><th>보증금</th><th>월세</th><th>관리</th>' })
+    );
+    document.querySelector('#monthlyRows')?.closest('table')?.querySelector('thead')?.replaceChildren(
+      Object.assign(document.createElement('tr'), { innerHTML: '<th>직원</th><th>계약 건수</th>' })
+    );
+    document.querySelector('#employeeRows')?.closest('table')?.querySelector('thead')?.replaceChildren(
+      Object.assign(document.createElement('tr'), { innerHTML: '<th>계약일</th><th>주소 / 호실</th>' })
+    );
+  } else {
+    // Restore the full table headers for the representative.
+    document.querySelector('#recentRows')?.closest('table')?.querySelector('thead')?.replaceChildren(
+      Object.assign(document.createElement('tr'), { innerHTML: '<th>직원</th><th>계약일</th><th>주소 / 호실</th><th class="amount">임차인</th><th class="amount">임대인</th><th class="amount">수수료 합계</th>' })
+    );
+    document.querySelector('#recordRows')?.closest('table')?.querySelector('thead')?.replaceChildren(
+      Object.assign(document.createElement('tr'), { innerHTML: '<th>직원</th><th>계약일</th><th>주소</th><th>호실</th><th>보증금</th><th>월세</th><th class="amount">임차인 수수료</th><th class="amount">임대인 수수료</th><th class="amount">합계</th><th>관리</th>' })
+    );
+    document.querySelector('#monthlyRows')?.closest('table')?.querySelector('thead')?.replaceChildren(
+      Object.assign(document.createElement('tr'), { innerHTML: '<th>직원</th><th>계약 건수</th><th class="amount">수수료 합계</th><th class="amount admin-only">대표 정산금액 (10단위 비율 적용)</th>' })
+    );
+    document.querySelector('#employeeRows')?.closest('table')?.querySelector('thead')?.replaceChildren(
+      Object.assign(document.createElement('tr'), { innerHTML: '<th>계약일</th><th>주소 / 호실</th><th class="amount">임차인 수수료</th><th class="amount">임대인 수수료</th><th class="amount">합계</th><th class="amount admin-only">대표 정산금액</th>' })
+    );
+  }
   renderRecords();
   renderEmployeeCards();
   renderEmployeeDetail();
@@ -1173,8 +1307,9 @@ function addExpenseRecord() {
   toast('경비 내역이 등록되었습니다.');
 }
 
-function deleteExpenseRecord(id) {
+async function deleteExpenseRecord(id) {
   if (!confirm('이 경비 내역을 삭제할까요?')) return;
+  try { await cloudDeleteItem('expenseRecords', id); } catch (err) { return alert(err.message); }
   expenseRecords = expenseRecords.filter(r => r.id !== id);
   save();
   renderExpensePage();
@@ -1185,17 +1320,24 @@ function deleteExpenseRecord(id) {
 function renderRecords() {
   let q = ($('searchBox')?.value || '').toLowerCase(),
       f = $('staffFilter')?.value || '';
-  let arr = records.filter(r => (!f || r.staff === f) && [r.address, r.building, r.unit, r.tenantMemo, r.landlordMemo].join(' ').toLowerCase().includes(q)).sort((a, b) => (b.contractDate || '').localeCompare(a.contractDate || ''));
+  let source = getVisibleRecords();
+  let arr = source.filter(r => (currentRole === 'employee' || !f || r.staff === f) && [r.address, r.building, r.unit, r.tenantMemo, r.landlordMemo].join(' ').toLowerCase().includes(q)).sort((a, b) => (b.contractDate || '').localeCompare(a.contractDate || ''));
   $('recordCount').textContent = arr.length + '건';
-  $('recordRows').innerHTML = arr.length ? arr.map(r => `<tr><td>${esc(r.staff)}</td><td>${esc(r.contractDate)}</td><td>${esc(r.address)}</td><td>${esc(r.unit || '')}</td><td>${manwon(r.deposit)}</td><td>${manwon(r.rent)}</td><td class="amount">${formatFee(r.tenantFee)}</td><td class="amount">${formatFee(r.landlordFee)}</td><td class="amount"><b>${formatFee(total(r))}</b></td><td><button class="secondary" onclick="editRecord('${r.id}')">수정</button> <button class="danger" onclick="deleteRecord('${r.id}')">삭제</button></td></tr>`).join('') : '<tr><td colspan="10" class="empty">검색 결과가 없습니다.</td></tr>';
+  if (currentRole === 'admin') {
+    $('recordRows').innerHTML = arr.length ? arr.map(r => `<tr><td>${esc(r.staff)}</td><td>${esc(r.contractDate)}</td><td>${esc(r.address)}</td><td>${esc(r.unit || '')}</td><td>${manwon(r.deposit)}</td><td>${manwon(r.rent)}</td><td class="amount">${formatFee(r.tenantFee)}</td><td class="amount">${formatFee(r.landlordFee)}</td><td class="amount"><b>${formatFee(total(r))}</b></td><td><button class="secondary" onclick="editRecord('${r.id}')">수정</button> <button class="danger" onclick="deleteRecord('${r.id}')">삭제</button></td></tr>`).join('') : '<tr><td colspan="10" class="empty">검색 결과가 없습니다.</td></tr>';
+  } else {
+    $('recordRows').innerHTML = arr.length ? arr.map(r => `<tr><td>${esc(r.contractDate)}</td><td>${esc(r.address)}</td><td>${esc(r.building || '')}</td><td>${esc(r.unit || '')}</td><td>${manwon(r.deposit)}</td><td>${manwon(r.rent)}</td><td><button class="secondary" onclick="editRecord('${r.id}')">수정</button></td></tr>`).join('') : '<tr><td colspan="7" class="empty">등록된 계약 내역이 없습니다.</td></tr>';
+  }
 }
 
 function renderEmployeeCards() {
   const targetRecords = getRoleFilteredRecords();
   const currentMonth = getCurrentMonthStr();
 
-  $('employeeCards').innerHTML = staffList.map(n => {
-    let a = byStaff(n, targetRecords);
+  const cardStaff = staffList;
+  const countRecords = records;
+  $('employeeCards').innerHTML = cardStaff.map(n => {
+    let a = byStaff(n, countRecords);
     let sumFee = a.reduce((s, r) => s + total(r), 0);
     let ratio = staffRatios[n] !== undefined ? staffRatios[n] : 100;
     let ratioFee = sumFee * (ratio / 100);
@@ -1203,7 +1345,9 @@ function renderEmployeeCards() {
 
     let adminRatioRow = currentRole === 'admin' ? `<small style="color:var(--gold2);font-weight:bold">대표 정산금액 (${ratio}%): ${formatFee(ratioFee)}</small>` : '';
 
-    return `<div class="emp"><h3>${esc(n)}</h3><strong>${a.length}건</strong><small>${periodText} 건수</small><small>수수료 합계: ${formatFee(sumFee)}</small>${adminRatioRow}</div>`;
+    return currentRole === 'admin'
+      ? `<div class="emp"><h3>${esc(n)}</h3><strong>${a.length}건</strong><small>${periodText} 건수</small><small>수수료 합계: ${formatFee(sumFee)}</small>${adminRatioRow}</div>`
+      : `<div class="emp"><h3>${esc(n)}</h3><strong>${a.length}건</strong><small>${periodText} 건수</small>`;
   }).join('');
 }
 
@@ -1214,7 +1358,8 @@ function renderMonthlyCounts() {
   let month = m.value,
       arr = records.filter(r => (r.contractDate || '').startsWith(month));
   
-  $('monthlyCounts').innerHTML = staffList.map(n => {
+  const monthlyStaff = staffList;
+  $('monthlyCounts').innerHTML = monthlyStaff.map(n => {
     let c = arr.filter(r => r.staff === n).length;
     return `<div class="monthbox"><span>${esc(n)}</span><b>${c}건</b><span>${month} 계약</span></div>`;
   }).join('');
@@ -1225,22 +1370,34 @@ function renderMonthlyCounts() {
     return s + (total(r) * (ratio / 100));
   }, 0);
 
-  $('monthlyRows').innerHTML = staffList.map(n => {
-    let empRecords = arr.filter(r => r.staff === n);
-    let empFee = empRecords.reduce((s, r) => s + total(r), 0);
-    let ratio = staffRatios[n] !== undefined ? staffRatios[n] : 100;
-    let empRatioFee = empFee * (ratio / 100);
-    let adminCol = currentRole === 'admin' ? `<td class="amount admin-only" style="color:var(--gold2)"><b>${formatFee(empRatioFee)}</b> (${ratio}%)</td>` : '';
-    return `<tr><td>${esc(n)}</td><td><b>${empRecords.length}건</b></td><td class="amount">${formatFee(empFee)}</td>${adminCol}</tr>`;
-  }).join('') + `<tr><th>전체 합계</th><th>${arr.length}건</th><th class="amount">${formatFee(totalFeeSum)}</th>${currentRole === 'admin' ? `<th class="amount admin-only" style="color:var(--gold2)">${formatFee(totalRatioFeeSum)}</th>` : ''}</tr>`;
+  if (currentRole === 'admin') {
+    $('monthlyRows').innerHTML = staffList.map(n => {
+      let empRecords = arr.filter(r => r.staff === n);
+      let empFee = empRecords.reduce((s, r) => s + total(r), 0);
+      let ratio = staffRatios[n] !== undefined ? staffRatios[n] : 100;
+      let empRatioFee = empFee * (ratio / 100);
+      return `<tr><td>${esc(n)}</td><td><b>${empRecords.length}건</b></td><td class="amount">${formatFee(empFee)}</td><td class="amount admin-only" style="color:var(--gold2)"><b>${formatFee(empRatioFee)}</b> (${ratio}%)</td></tr>`;
+    }).join('') + `<tr><th>전체 합계</th><th>${arr.length}건</th><th class="amount">${formatFee(totalFeeSum)}</th><th class="amount admin-only" style="color:var(--gold2)">${formatFee(totalRatioFeeSum)}</th></tr>`;
+  } else {
+    $('monthlyRows').innerHTML = staffList.map(n => {
+      const empCount = arr.filter(r => r.staff === n).length;
+      return `<tr><td>${esc(n)}</td><td><b>${empCount}건</b></td></tr>`;
+    }).join('') + `<tr><th>전체 합계</th><th>${arr.length}건</th></tr>`;
+  }
 }
 
 function renderEmployeeDetail() {
+  if (currentRole === 'employee') {
+    $('employeeSelect').value = currentEmployeeName;
+    $('employeeSelect').disabled = true;
+  } else {
+    $('employeeSelect').disabled = false;
+  }
   if (!$('employeeSelect').value) return;
-  let n = $('employeeSelect').value;
+  let n = currentRole === 'employee' ? currentEmployeeName : $('employeeSelect').value;
   let selectedMonth = $('employeeDetailMonth')?.value || '';
   
-  let a = byStaff(n, records);
+  let a = byStaff(n, currentRole === 'admin' ? records : records.filter(r => r.staff === currentEmployeeName));
   if (selectedMonth) {
     a = a.filter(r => (r.contractDate || '').startsWith(selectedMonth));
   }
@@ -1249,10 +1406,12 @@ function renderEmployeeDetail() {
   let ratio = staffRatios[n] !== undefined ? staffRatios[n] : 100;
 
   $('employeeRows').innerHTML = a.length ? a.map(r => {
+    if (currentRole === 'employee') {
+      return `<tr><td>${esc(r.contractDate)}</td><td>${esc(r.address)} ${esc(r.unit || '')}</td></tr>`;
+    }
     let tot = total(r);
     let rFee = tot * (ratio / 100);
-    let adminCol = currentRole === 'admin' ? `<td class="amount admin-only" style="color:var(--gold2)"><b>${formatFee(rFee)}</b> (${ratio}%)</td>` : '';
-    return `<tr><td>${esc(r.contractDate)}</td><td>${esc(r.address)} ${esc(r.unit || '')}</td><td class="amount">${formatFee(r.tenantFee)}</td><td class="amount">${formatFee(r.landlordFee)}</td><td class="amount"><b>${formatFee(tot)}</b></td>${adminCol}</tr>`;
+    return `<tr><td>${esc(r.contractDate)}</td><td>${esc(r.address)} ${esc(r.unit || '')}</td><td class="amount">${formatFee(r.tenantFee)}</td><td class="amount">${formatFee(r.landlordFee)}</td><td class="amount"><b>${formatFee(tot)}</b></td><td class="amount admin-only" style="color:var(--gold2)"><b>${formatFee(rFee)}</b> (${ratio}%)</td></tr>`;
   }).join('') : '<tr><td colspan="6" class="empty">해당 월의 내역이 없습니다.</td></tr>';
 }
 
@@ -1353,8 +1512,9 @@ function addMealRecord() {
   toast('식대 지출 내역이 등록되었습니다.');
 }
 
-function deleteMealRecord(id) {
+async function deleteMealRecord(id) {
   if (!confirm('이 식대 내역을 삭제할까요?')) return;
+  try { await cloudDeleteItem('mealRecords', id); } catch (err) { return alert(err.message); }
   mealRecords = mealRecords.filter(r => r.id !== id);
   save();
   renderMealPage();
@@ -1382,7 +1542,11 @@ function resetForm() {
 }
 
 function updatePreview() {
-  $('feePreview').textContent = won((+$('tenantFee').value || 0) + (+$('landlordFee').value || 0));
+  if (currentRole === 'admin') {
+    $('feePreview').textContent = won((+$('tenantFee').value || 0) + (+$('landlordFee').value || 0));
+  } else {
+    $('feePreview').textContent = '';
+  }
 }
 
 $('recordForm').addEventListener('submit', e => {
@@ -1403,8 +1567,22 @@ $('recordForm').addEventListener('submit', e => {
     landlordMemo: $('landlordMemo').value.trim(),
     memo: $('memo').value.trim()
   };
+  if (currentRole === 'employee') {
+    r.staff = currentEmployeeName;
+    const existingRecord = records.find(x => x.id === id);
+    if (existingRecord && existingRecord.staff !== currentEmployeeName) {
+      alert('본인이 등록한 계약만 수정할 수 있습니다.');
+      return;
+    }
+  }
   let i = records.findIndex(x => x.id === id);
-  if (i >= 0) records[i] = r;
+  if (i >= 0) {
+    if (currentRole !== 'admin' && records[i].staff !== currentEmployeeName) {
+      alert('본인이 등록한 계약만 수정할 수 있습니다.');
+      return;
+    }
+    records[i] = r;
+  }
   else records.push(r);
   save();
   toast(i >= 0 ? '수정 내용이 저장되었습니다.' : '정산 내역이 등록되었습니다.');
@@ -1414,6 +1592,7 @@ $('recordForm').addEventListener('submit', e => {
 function editRecord(id) {
   let r = records.find(x => x.id === id);
   if (!r) return;
+  if (currentRole === 'employee' && r.staff !== currentEmployeeName) return;
   showPage('entry');
   $('editId').value = r.id;
   $('formTitle').textContent = '정산 내역 수정';
@@ -1425,8 +1604,9 @@ function editRecord(id) {
   updatePreview();
 }
 
-function deleteRecord(id) {
+async function deleteRecord(id) {
   if (!confirm('이 정산 내역을 삭제할까요?')) return;
+  try { await cloudDeleteItem('records', id); } catch (err) { return alert(err.message); }
   records = records.filter(r => r.id !== id);
   save();
   renderAll();
@@ -1491,6 +1671,7 @@ function importData(e) {
 }
 
 renderAll();
+document.body.classList.add('employee-view');
 </script>
 </body>
 </html>
